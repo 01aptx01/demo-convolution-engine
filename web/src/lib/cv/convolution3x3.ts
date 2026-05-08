@@ -4,8 +4,22 @@ export type Kernel3x3 = [
   [number, number, number],
 ];
 
-function clamp(v: number, lo: number, hi: number) {
-  return v < lo ? lo : v > hi ? hi : v;
+import { convolveGrayNxNInto, type BorderPolicy } from "@/lib/cv/convolutionNxN";
+
+export type { BorderPolicy };
+
+function flattenKernel3x3(k: Kernel3x3): Float32Array {
+  return new Float32Array([
+    k[0][0],
+    k[0][1],
+    k[0][2],
+    k[1][0],
+    k[1][1],
+    k[1][2],
+    k[2][0],
+    k[2][1],
+    k[2][2],
+  ]);
 }
 
 export function convolve3x3Gray(
@@ -13,7 +27,7 @@ export function convolve3x3Gray(
   width: number,
   height: number,
   k: Kernel3x3,
-  opts?: { bias?: number; scale?: number },
+  opts?: { bias?: number; scale?: number; policy?: BorderPolicy },
 ): Uint8ClampedArray {
   // Core sliding-window convolution:
   // For each pixel, take the 3x3 neighborhood and compute dot(kernel, neighborhood).
@@ -29,53 +43,10 @@ export function convolve3x3GrayInto(
   width: number,
   height: number,
   k: Kernel3x3,
-  opts: { bias?: number; scale?: number } | undefined,
+  opts: { bias?: number; scale?: number; policy?: BorderPolicy } | undefined,
   out: Uint8ClampedArray,
 ): void {
-  if (out.length !== width * height) {
-    throw new Error("out length must equal width*height");
-  }
-
-  const bias = opts?.bias ?? 0;
-  const scale = opts?.scale ?? 1;
-
-  for (let y = 0; y < height; y++) {
-    const y0 = clamp(y - 1, 0, height - 1);
-    const y1 = y;
-    const y2 = clamp(y + 1, 0, height - 1);
-
-    for (let x = 0; x < width; x++) {
-      const x0 = clamp(x - 1, 0, width - 1);
-      const x1 = x;
-      const x2 = clamp(x + 1, 0, width - 1);
-
-      const p00 = gray[y0 * width + x0];
-      const p01 = gray[y0 * width + x1];
-      const p02 = gray[y0 * width + x2];
-      const p10 = gray[y1 * width + x0];
-      const p11 = gray[y1 * width + x1];
-      const p12 = gray[y1 * width + x2];
-      const p20 = gray[y2 * width + x0];
-      const p21 = gray[y2 * width + x1];
-      const p22 = gray[y2 * width + x2];
-
-      const sum =
-        k[0][0] * p00 +
-        k[0][1] * p01 +
-        k[0][2] * p02 +
-        k[1][0] * p10 +
-        k[1][1] * p11 +
-        k[1][2] * p12 +
-        k[2][0] * p20 +
-        k[2][1] * p21 +
-        k[2][2] * p22;
-
-      // Educational knobs:
-      // - scale lets you normalize kernels (e.g. box blur scale=1/9)
-      // - bias lets you shift values (e.g. bias=128 to visualize signed gradients)
-      const v = sum * scale + bias;
-      out[y * width + x] = v < 0 ? 0 : v > 255 ? 255 : v;
-    }
-  }
+  const kernel = flattenKernel3x3(k);
+  convolveGrayNxNInto(gray, width, height, kernel, 3, opts?.policy ?? "clamp", opts, out);
 }
 

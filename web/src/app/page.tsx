@@ -1,13 +1,19 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { KernelGrid3x3 } from "@/components/KernelGrid3x3";
+import { Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { KernelGridNxN } from "@/components/KernelGridNxN";
 import { MathInspectorOverlay } from "@/components/MathInspectorOverlay";
-import { convolve3x3GrayInto, type Kernel3x3 } from "@/lib/cv/convolution3x3";
+import { convolveGrayNxNInto, type BorderPolicy } from "@/lib/cv/convolutionNxN";
 import { grayU8ToRgbaInto } from "@/lib/cv/grayToRgba";
 import { rgbaToGrayscaleLumaInto } from "@/lib/cv/grayscale";
-import { inspectConvolutionAtPointer } from "@/lib/cv/inspector3x3";
+import { inspectConvolutionAtPixel, inspectConvolutionAtPointer } from "@/lib/cv/inspector3x3";
 import { useWebcamStream } from "@/hooks/useWebcamStream";
+import { useQueryState } from "@/hooks/useQueryState";
+import { PerfOverlay } from "@/components/PerfOverlay";
+import { SlidingWindowDebugger } from "@/components/SlidingWindowDebugger";
+import { drawKernelOverlay } from "@/lib/ui/drawKernelOverlay";
+import { sobelMagnitude3x3Into, type MagnitudeMode } from "@/lib/cv/sobelMagnitude";
+import { inspectConvolutionNxNAtPixel } from "@/lib/cv/inspectorNxN";
 
 type LoadedImage = {
   width: number;
@@ -16,6 +22,7 @@ type LoadedImage = {
 };
 
 type SourceMode = "upload" | "webcam";
+type EdgeMode = "off" | "sobel";
 
 function drawRgbaToCanvas(
   canvas: HTMLCanvasElement,
@@ -55,24 +62,30 @@ async function fileToRgba(file: File): Promise<LoadedImage> {
   return { width: w, height: h, rgba };
 }
 
-export default function Home() {
-  const [mode, setMode] = useState<SourceMode>("upload");
+function HomeInner() {
+  const { state: qs, setState: setQs } = useQueryState();
+
+  const [mode, setMode] = useState<SourceMode>(qs.source);
 
   const originalCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const outputCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const stageCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const [loaded, setLoaded] = useState<LoadedImage | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const [kernel, setKernel] = useState<Kernel3x3>([
-    [-1, 0, 1],
-    [-2, 0, 2],
-    [-1, 0, 1],
-  ]);
-  const [scale, setScale] = useState<number>(1);
-  const [bias, setBias] = useState<number>(128);
+  const [kSize, setKSize] = useState<3 | 5 | 7>(qs.kSize);
+  const [kernel, setKernel] = useState<number[]>(qs.kernel);
+  const [scale, setScale] = useState<number>(qs.scale);
+  const [bias, setBias] = useState<number>(qs.bias);
+  const [policy, setPolicy] = useState<BorderPolicy>(qs.policy);
+  const [edgeMode, setEdgeMode] = useState<EdgeMode>(qs.edge);
+  const [magMode, setMagMode] = useState<MagnitudeMode>(qs.mag);
+  const [paused, setPaused] = useState<boolean>(qs.paused);
+  const [debugXY, setDebugXY] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [debugEquation, setDebugEquation] = useState<[string, string] | null>(null);
 
   // Buffers reused across recomputes and webcam frames.
   const buffersRef = useRef<{
@@ -82,7 +95,12 @@ export default function Home() {
     outU8: Uint8ClampedArray;
     outRgba: Uint8ClampedArray;
     outImageData: ImageData | null;
+    // Scratch buffers for Sobel.
+    gx?: Float32Array;
+    gy?: Float32Array;
   } | null>(null);
+
+  const allocCountRef = useRef(0);
 
   const ensureBuffers = (width: number, height: number, ctx: CanvasRenderingContext2D) => {
     const needNew =
@@ -96,6 +114,7 @@ export default function Home() {
     const outU8 = new Uint8ClampedArray(width * height);
     const outRgba = new Uint8ClampedArray(width * height * 4);
     const outImageData = ctx.createImageData(width, height);
+    allocCountRef.current++;
 
     buffersRef.current = { width, height, gray, outU8, outRgba, outImageData };
     return buffersRef.current;
@@ -112,7 +131,32 @@ export default function Home() {
 
     const b = ensureBuffers(width, height, outCtx);
     rgbaToGrayscaleLumaInto(rgba, width, height, b.gray);
-    convolve3x3GrayInto(b.gray, width, height, kernel, { scale, bias }, b.outU8);
+
+    if (edgeMode === "sobel") {
+      if (!b.gx || b.gx.length !== width * height) {
+        b.gx = new Float32Array(width * height);
+        b.gy = new Float32Array(width * height);
+        allocCountRef.current++;
+      }
+      sobelMagnitude3x3Into({
+        gray: b.gray,
+        width,
+        height,
+        policy,
+        mode: magMode,
+        outU8: b.outU8,
+        scratchGx: b.gx,
+        scratchGy: b.gy!,
+        scale,
+        bias,
+      });
+    } else {
+      const expected = kSize * kSize;
+      const kArr = kernel.length === expected ? kernel : new Array(expected).fill(0);
+      const kF32 = new Float32Array(kArr);
+      convolveGrayNxNInto(b.gray, width, height, kF32, kSize, policy, { scale, bias }, b.outU8);
+    }
+
     grayU8ToRgbaInto(b.outU8, width, height, b.outRgba);
 
     // Write into ImageData and blit.
@@ -137,11 +181,11 @@ export default function Home() {
     if (!loaded) return;
     processFrame(loaded.rgba, loaded.width, loaded.height);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, loaded, kernel, scale, bias]);
+  }, [mode, loaded, kernel, kSize, policy, edgeMode, magMode, scale, bias]);
 
   // Webcam setup
   const webcam = useWebcamStream({
-    enabled: mode === "webcam",
+    enabled: mode === "webcam" && !paused,
     videoEl: videoRef.current,
   });
 
@@ -150,6 +194,7 @@ export default function Home() {
   useEffect(() => {
     if (mode !== "webcam") return;
     if (webcam.status !== "ready") return;
+    if (paused) return;
 
     const video = videoRef.current;
     const stageCanvas = stageCanvasRef.current;
@@ -201,7 +246,7 @@ export default function Home() {
       rafRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, webcam.status, kernel, scale, bias]);
+  }, [mode, webcam.status, paused, kernel, kSize, policy, edgeMode, magMode, scale, bias]);
 
   // Math inspector hover state (throttled to rAF).
   const [inspectorVisible, setInspectorVisible] = useState(false);
@@ -233,7 +278,11 @@ export default function Home() {
         imageWidth: b.width,
         imageHeight: b.height,
         gray: b.gray,
-        kernel,
+        kernel: [
+          [kernel[0] ?? 0, kernel[1] ?? 0, kernel[2] ?? 0],
+          [kernel[3] ?? 0, kernel[4] ?? 0, kernel[5] ?? 0],
+          [kernel[6] ?? 0, kernel[7] ?? 0, kernel[8] ?? 0],
+        ],
         scale,
         bias,
         outputU8: b.outU8,
@@ -243,6 +292,70 @@ export default function Home() {
       setInspectorData(res);
     });
   };
+
+  // Keep URL query in sync with current UI controls (shareable presets).
+  useEffect(() => {
+    setQs({
+      source: mode,
+      kSize,
+      kernel,
+      scale,
+      bias,
+      policy,
+      edge: edgeMode,
+      mag: magMode,
+      paused,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, kSize, kernel, scale, bias, policy, edgeMode, magMode, paused]);
+
+  // Debug overlay draw (on the input/original canvas).
+  useEffect(() => {
+    if (!paused) {
+      const overlay = overlayCanvasRef.current;
+      if (overlay) {
+        const ctx = overlay.getContext("2d");
+        if (ctx) ctx.clearRect(0, 0, overlay.width, overlay.height);
+      }
+      return;
+    }
+
+    const base = originalCanvasRef.current;
+    const overlay = overlayCanvasRef.current;
+    const b = buffersRef.current;
+    if (!base || !overlay || !b) return;
+
+    overlay.width = base.width;
+    overlay.height = base.height;
+    const octx = overlay.getContext("2d");
+    if (!octx) return;
+
+    drawKernelOverlay({
+      ctx: octx,
+      width: overlay.width,
+      height: overlay.height,
+      x: debugXY.x,
+      y: debugXY.y,
+      kSize,
+    });
+
+    const expected = kSize * kSize;
+    const kArr = kernel.length === expected ? kernel : new Array(expected).fill(0);
+    const kF32 = new Float32Array(kArr);
+    const resNxN = inspectConvolutionNxNAtPixel({
+      x: debugXY.x,
+      y: debugXY.y,
+      imageWidth: b.width,
+      imageHeight: b.height,
+      gray: b.gray,
+      kernel: kF32,
+      kSize,
+      policy,
+      scale,
+      bias,
+    });
+    setDebugEquation(resNxN?.equationLines ?? null);
+  }, [paused, debugXY.x, debugXY.y, kSize, kernel, scale, bias]);
 
   return (
     <div className="min-h-full bg-zinc-50 text-zinc-950 dark:bg-zinc-950 dark:text-zinc-50">
@@ -286,6 +399,17 @@ export default function Home() {
                   }}
                 >
                   Webcam
+                </button>
+                <button
+                  type="button"
+                  className={`rounded-lg px-3 py-2 text-sm font-medium ${
+                    paused
+                      ? "bg-amber-500 text-zinc-950 hover:bg-amber-400"
+                      : "bg-zinc-100 text-zinc-900 hover:bg-zinc-200 dark:bg-zinc-900 dark:text-zinc-50 dark:hover:bg-zinc-800"
+                  }`}
+                  onClick={() => setPaused((p) => !p)}
+                >
+                  {paused ? "Paused" : "Pause"}
                 </button>
                 {mode === "webcam" ? (
                   <div className="text-xs text-zinc-600 dark:text-zinc-400">
@@ -341,13 +465,72 @@ export default function Home() {
 
               <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-800 dark:bg-zinc-950">
                 <div className="flex items-baseline justify-between gap-4">
-                  <div className="text-sm font-semibold">3×3 kernel</div>
+                  <div className="text-sm font-semibold">Kernel</div>
                   <div className="text-xs text-zinc-500 dark:text-zinc-400">
-                    dot(kernel, neighborhood)
+                    O(W·H·K²)
                   </div>
                 </div>
                 <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:items-start sm:gap-6">
-                  <KernelGrid3x3 kernel={kernel} onChange={setKernel} />
+                  <div className="flex flex-col gap-2">
+                    <div className="flex items-center gap-2">
+                      <label className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                        kSize
+                      </label>
+                      <select
+                        className="h-9 rounded-lg border border-zinc-200 bg-white px-2 text-sm dark:border-zinc-800 dark:bg-zinc-950"
+                        value={kSize}
+                        onChange={(e) => {
+                          const next = Number(e.target.value) as 3 | 5 | 7;
+                          setKSize(next);
+                          setKernel(new Array(next * next).fill(0));
+                        }}
+                      >
+                        <option value={3}>3×3</option>
+                        <option value={5}>5×5</option>
+                        <option value={7}>7×7</option>
+                      </select>
+                      <label className="ml-2 text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                        policy
+                      </label>
+                      <select
+                        className="h-9 rounded-lg border border-zinc-200 bg-white px-2 text-sm dark:border-zinc-800 dark:bg-zinc-950"
+                        value={policy}
+                        onChange={(e) => setPolicy(e.target.value as BorderPolicy)}
+                      >
+                        <option value="clamp">clamp</option>
+                        <option value="zero">zero</option>
+                        <option value="wrap">wrap</option>
+                      </select>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <label className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                        edges
+                      </label>
+                      <select
+                        className="h-9 rounded-lg border border-zinc-200 bg-white px-2 text-sm dark:border-zinc-800 dark:bg-zinc-950"
+                        value={edgeMode}
+                        onChange={(e) => setEdgeMode(e.target.value as EdgeMode)}
+                      >
+                        <option value="off">off</option>
+                        <option value="sobel">sobel</option>
+                      </select>
+                      <label className="ml-2 text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                        mag
+                      </label>
+                      <select
+                        className="h-9 rounded-lg border border-zinc-200 bg-white px-2 text-sm dark:border-zinc-800 dark:bg-zinc-950"
+                        value={magMode}
+                        onChange={(e) => setMagMode(e.target.value as MagnitudeMode)}
+                        disabled={edgeMode !== "sobel"}
+                      >
+                        <option value="l1">L1</option>
+                        <option value="l2">L2</option>
+                      </select>
+                    </div>
+
+                    <KernelGridNxN kSize={kSize} kernel={kernel} onChange={setKernel} />
+                  </div>
                   <div className="grid grid-cols-2 gap-3 text-sm">
                     <label className="flex flex-col gap-1">
                       <span className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
@@ -383,11 +566,11 @@ export default function Home() {
                       type="button"
                       className="col-span-2 rounded-lg bg-zinc-900 px-3 py-2 text-sm font-medium text-white hover:bg-zinc-800 dark:bg-zinc-50 dark:text-zinc-950 dark:hover:bg-zinc-200"
                       onClick={() => {
-                        setKernel([
-                          [0, 0, 0],
-                          [0, 1, 0],
-                          [0, 0, 0],
-                        ]);
+                        // Identity kernel for current kSize.
+                        const next = new Array(kSize * kSize).fill(0);
+                        const c = ((kSize - 1) >> 1) * kSize + ((kSize - 1) >> 1);
+                        next[c] = 1;
+                        setKernel(next);
                         setScale(1);
                         setBias(0);
                       }}
@@ -407,6 +590,35 @@ export default function Home() {
           ) : null}
         </section>
 
+        <section className="mt-6">
+          <SlidingWindowDebugger
+            enabled={paused}
+            width={buffersRef.current?.width ?? 0}
+            height={buffersRef.current?.height ?? 0}
+            kSize={kSize}
+            x={debugXY.x}
+            y={debugXY.y}
+            onChange={setDebugXY}
+            onStep={(dx, dy) =>
+              setDebugXY((p) => ({
+                x: Math.max(0, Math.min((buffersRef.current?.width ?? 1) - 1, p.x + dx)),
+                y: Math.max(0, Math.min((buffersRef.current?.height ?? 1) - 1, p.y + dy)),
+              }))
+            }
+          />
+          {paused && debugEquation ? (
+            <div className="mt-3 rounded-xl border border-zinc-200 bg-white p-3 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+              <div className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
+                Debug equation (NxN)
+              </div>
+              <div className="mt-2 space-y-1 break-words font-mono text-[11px] leading-4 text-zinc-900 dark:text-zinc-50">
+                <div>{debugEquation[0]}</div>
+                <div className="text-zinc-700 dark:text-zinc-300">{debugEquation[1]}</div>
+              </div>
+            </div>
+          ) : null}
+        </section>
+
         <section className="mt-8 grid grid-cols-1 gap-6 lg:grid-cols-2">
           <div className="rounded-xl border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
             <div className="flex items-baseline justify-between">
@@ -415,8 +627,12 @@ export default function Home() {
                 ctx.getImageData().data
               </span>
             </div>
-            <div className="mt-3 overflow-auto rounded-lg bg-zinc-100 p-2 dark:bg-zinc-950">
+            <div className="relative mt-3 overflow-auto rounded-lg bg-zinc-100 p-2 dark:bg-zinc-950">
               <canvas ref={originalCanvasRef} className="block max-w-full" />
+              <canvas
+                ref={overlayCanvasRef}
+                className="pointer-events-none absolute left-2 top-2 block"
+              />
             </div>
           </div>
 
@@ -456,6 +672,17 @@ export default function Home() {
         <video ref={videoRef} className="hidden" />
         <canvas ref={stageCanvasRef} className="hidden" />
       </div>
+
+      <PerfOverlay enabled={true} allocCount={allocCountRef.current} />
     </div>
+  );
+}
+
+export default function Home() {
+  // Next.js requires `useSearchParams()` (used by `useQueryState`) to be under a Suspense boundary.
+  return (
+    <Suspense fallback={null}>
+      <HomeInner />
+    </Suspense>
   );
 }

@@ -1,16 +1,30 @@
 # X-Ray Vision: Matrix Convolution Engine (Next.js + Flask)
 
-Interactive educational web application that demonstrates the **raw mathematics** behind image filtering and edge detection using a **from-scratch** 3×3 convolution engine.
+Interactive educational web application that demonstrates the **raw mathematics** behind image filtering and edge detection using a **from-scratch convolution engine** (dynamic **3×3 / 5×5 / 7×7**).
 
-Crucial constraint: **No ready-made computer vision libraries** (e.g. OpenCV). The client-side engine operates directly on `ImageData` RGBA arrays and uses pure math.
+Crucial constraint: **No ready-made computer vision libraries** (e.g. OpenCV). The client-side engine operates directly on `ImageData` RGBA arrays and uses pure procedural math with typed arrays.
+
+## What it can do (Boss Level)
+- **Sources**: Upload image or **Live Webcam** (frame-by-frame convolution via `requestAnimationFrame`)
+- **Dynamic kernel**: 3×3 / 5×5 / 7×7 kernel grid + `scale` + `bias`
+- **Border policy toggle**: `clamp` / `zero` / `wrap`
+- **Sobel edge magnitude**: compute **Gx + Gy** with magnitude toggle (**L1** or **L2**)
+- **Math Inspector**: hover output canvas to see the exact neighborhood + dot-product equation
+- **Sliding Window Debugger**: pause realtime feed and step pixel-by-pixel (x,y), with NxN equation
+- **Shareable URL state**: kernel/policy/scale/bias/mode/edge settings encoded into query params
+- **Performance overlay**: FPS + “Allocations/frame (app-controlled buffers)”
+
+## Screenshot
+
+![App screenshot](docs/screenshot.png)
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  BrowserUI[BrowserUI_Nextjs] -->|uploadImage| CanvasHidden[HiddenCanvas_ImageData]
+  BrowserUI[BrowserUI_Nextjs] -->|upload_or_webcam| CanvasHidden[HiddenCanvas_ImageData]
   CanvasHidden -->|rgbaUint8ClampedArray| GrayscaleFn[rgbaToGrayscaleLuma]
-  GrayscaleFn -->|grayFloat32| ConvolutionFn[convolve3x3Gray]
+  GrayscaleFn -->|grayFloat32| ConvolutionFn[convolveNxN_or_SobelMagnitude]
   ConvolutionFn -->|resultUint8Clamped| CanvasOutput[OutputCanvas]
   BrowserUI -->|fetchPresets| FlaskAPI[FlaskAPI]
   FlaskAPI -->|jsonPresets| BrowserUI
@@ -26,13 +40,20 @@ flowchart LR
 ```
 .
 ├─ web/                      # Next.js app (UI + canvas + math engine)
-│  ├─ src/app/page.tsx        # Upload + canvases + kernel grid + live recompute
+│  ├─ src/app/page.tsx        # Upload/Webcam + NxN kernel + debugger + URL state + perf overlay
 │  ├─ src/components/
-│  │  └─ KernelGrid3x3.tsx    # 3×3 kernel input grid component
+│  │  ├─ KernelGridNxN.tsx           # 3/5/7 kernel grid input
+│  │  ├─ MathInspectorOverlay.tsx    # hover math panel
+│  │  ├─ SlidingWindowDebugger.tsx   # pause + stepper UI
+│  │  └─ PerfOverlay.tsx             # FPS + allocations overlay
 │  └─ src/lib/cv/
 │     ├─ grayscale.ts         # RGBA -> grayscale luma (Float32)
-│     ├─ convolution3x3.ts    # Sliding-window 3×3 convolution (O(N×M))
+│     ├─ convolutionNxN.ts    # Sliding-window NxN convolution + border policy (O(W*H*K^2))
+│     ├─ convolution3x3.ts    # 3×3 wrapper delegating to NxN
+│     ├─ sobelMagnitude.ts    # Sobel Gx/Gy + magnitude (L1/L2)
 │     └─ grayToRgba.ts        # Grayscale U8 -> RGBA for canvas ImageData
+├─ docs/
+│  └─ screenshot.png          # README screenshot
 ├─ server/
 │  ├─ main.py                 # Flask API: /health and /kernels
 │  └─ requirements.txt        # flask, flask-cors
@@ -64,27 +85,40 @@ Implementation: `web/src/lib/cv/grayscale.ts` (`rgbaToGrayscaleLuma`).
 - Input: `Uint8ClampedArray` RGBA
 - Output: `Float32Array` grayscale (one value per pixel)
 
-### 3) 3×3 Convolution engine (sliding window, O(N×M))
-For each pixel, we take its **3×3 neighborhood** and compute a dot product with a **dynamic 3×3 kernel**:
+### 3) NxN Convolution engine (sliding window, O(W*H*K^2))
+For each pixel, we take its **K×K neighborhood** and compute a dot product with a dynamic odd-sized kernel (K = 3/5/7):
 
 \[
-out(x,y) = \\sum_{j=-1}^{1} \\sum_{i=-1}^{1} k(i,j)\\cdot gray(x+i, y+j)
+out(x,y) = \\sum_{j=-r}^{r} \\sum_{i=-r}^{r} k(i,j)\\cdot gray(x+i, y+j)
 \]
 
-- **Border policy**: clamp-to-edge (replicate edges) so output is same size.
+- **Border policy**: selectable (`clamp`, `zero`, `wrap`) to demonstrate boundary effects.
 - **Educational knobs**:
   - `scale`: normalize kernels (e.g. box blur uses scale \(1/9\))
   - `bias`: shift output (e.g. `128` to visualize signed gradients)
 - Final output is clamped to `0..255` for display.
 
-Implementation: `web/src/lib/cv/convolution3x3.ts` (`convolve3x3Gray`).
+Implementation: `web/src/lib/cv/convolutionNxN.ts` (`convolveGrayNxNInto`) and `web/src/lib/cv/convolution3x3.ts` (compat wrapper).
 
-### 4) Real-time interactivity (3×3 kernel grid)
-The UI renders a 3×3 numeric input grid and binds it to React state.
+### 4) Real-time interactivity (NxN kernel grid)
+The UI renders an NxN numeric input grid and binds it to React state.
 Any coefficient change triggers immediate re-computation and redraw.
 
-- Component: `web/src/components/KernelGrid3x3.tsx`
+- Component: `web/src/components/KernelGridNxN.tsx`
 - Wiring: `web/src/app/page.tsx`
+
+### 5) Sobel edge magnitude (Gx + Gy)
+Optionally compute Sobel gradients and combine as edge magnitude:
+- L1: \(M = |G_x| + |G_y|\)
+- L2: \(M = \\sqrt{G_x^2 + G_y^2}\)
+
+Implementation: `web/src/lib/cv/sobelMagnitude.ts`.
+
+### 6) Debug/Inspector features
+- **Math Inspector** (hover output): shows neighborhood + dot product equation.
+- **Sliding Window Debugger**: pause and step (x,y), plus NxN equation panel.
+
+See `explaination.md` for the full teaching walkthrough.
 
 ### 5) Convert filtered grayscale back to RGBA for canvas
 Canvas `ImageData` expects RGBA, so we expand 1-channel grayscale to RGBA with alpha=255.
@@ -143,4 +177,4 @@ Open:
 
 ## Implementation notes / constraints
 - **No OpenCV / no CV libraries**: all image operations are implemented from scratch on raw arrays.
-- **Performance**: inner loops use typed arrays and simple arithmetic. The convolution is the classic \(O(N\\times M)\) sliding window for a 3×3 kernel.
+- **Performance**: inner loops use typed arrays and simple arithmetic; realtime webcam mode uses `_Into` variants and buffer reuse to reduce GC pressure.

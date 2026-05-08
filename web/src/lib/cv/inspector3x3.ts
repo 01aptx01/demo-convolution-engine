@@ -38,12 +38,9 @@ export type Inspector3x3Result = {
   equationLines: [string, string];
 };
 
-export function inspectConvolutionAtPointer(args: {
-  clientX: number;
-  clientY: number;
-  canvasRect: DOMRect;
-  canvasWidth: number;
-  canvasHeight: number;
+export function inspectConvolutionAtPixel(args: {
+  x: number;
+  y: number;
   imageWidth: number;
   imageHeight: number;
   gray: Float32Array;
@@ -52,34 +49,13 @@ export function inspectConvolutionAtPointer(args: {
   bias: number;
   outputU8?: Uint8ClampedArray;
 }): Inspector3x3Result | null {
-  const {
-    clientX,
-    clientY,
-    canvasRect,
-    canvasWidth,
-    canvasHeight,
-    imageWidth,
-    imageHeight,
-    gray,
-    kernel,
-    scale,
-    bias,
-    outputU8,
-  } = args;
-
+  const { x: xIn, y: yIn, imageWidth, imageHeight, gray, kernel, scale, bias, outputU8 } =
+    args;
   if (imageWidth <= 0 || imageHeight <= 0) return null;
   if (gray.length !== imageWidth * imageHeight) return null;
 
-  // Map mouse coordinates (CSS pixels) -> canvas pixel coordinates.
-  const cx =
-    (clientX - canvasRect.left) *
-    (canvasWidth / Math.max(1, canvasRect.width));
-  const cy =
-    (clientY - canvasRect.top) *
-    (canvasHeight / Math.max(1, canvasRect.height));
-
-  const x = clamp(Math.floor(cx), 0, imageWidth - 1);
-  const y = clamp(Math.floor(cy), 0, imageHeight - 1);
+  const x = clamp(xIn, 0, imageWidth - 1);
+  const y = clamp(yIn, 0, imageHeight - 1);
 
   // Clamp-to-edge border policy.
   const x0 = clamp(x - 1, 0, imageWidth - 1);
@@ -124,7 +100,8 @@ export function inspectConvolutionAtPointer(args: {
   const clamped = scaled < 0 ? 0 : scaled > 255 ? 255 : scaled;
 
   const fmt = (n: number) => (Number.isFinite(n) ? n.toFixed(2) : "NaN");
-  const fmtInt = (n: number) => (Number.isFinite(n) ? String(Math.round(n)) : "NaN");
+  const fmtInt = (n: number) =>
+    Number.isFinite(n) ? String(Math.round(n)) : "NaN";
 
   const eq1Parts: string[] = [
     `${fmtInt(p00)}*(${k00})`,
@@ -157,5 +134,60 @@ export function inspectConvolutionAtPointer(args: {
     outputPixelU8,
     equationLines: [eq1, eq2],
   };
+}
+
+export function inspectConvolutionAtPointer(args: {
+  clientX: number;
+  clientY: number;
+  canvasRect: DOMRect;
+  canvasWidth: number;
+  canvasHeight: number;
+  imageWidth: number;
+  imageHeight: number;
+  gray: Float32Array;
+  kernel: Kernel3x3;
+  scale: number;
+  bias: number;
+  outputU8?: Uint8ClampedArray;
+}): Inspector3x3Result | null {
+  const {
+    clientX,
+    clientY,
+    canvasRect,
+    canvasWidth,
+    canvasHeight,
+    imageWidth,
+    imageHeight,
+    gray,
+    kernel,
+    scale,
+    bias,
+    outputU8,
+  } = args;
+
+  if (imageWidth <= 0 || imageHeight <= 0) return null;
+  if (gray.length !== imageWidth * imageHeight) return null;
+
+  // Map mouse coordinates (CSS pixels) -> canvas pixel coordinates.
+  const cx =
+    (clientX - canvasRect.left) *
+    (canvasWidth / Math.max(1, canvasRect.width));
+  const cy =
+    (clientY - canvasRect.top) *
+    (canvasHeight / Math.max(1, canvasRect.height));
+
+  const x = clamp(Math.floor(cx), 0, imageWidth - 1);
+  const y = clamp(Math.floor(cy), 0, imageHeight - 1);
+  return inspectConvolutionAtPixel({
+    x,
+    y,
+    imageWidth,
+    imageHeight,
+    gray,
+    kernel,
+    scale,
+    bias,
+    outputU8,
+  });
 }
 
