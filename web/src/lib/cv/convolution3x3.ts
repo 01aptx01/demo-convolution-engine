@@ -20,6 +20,22 @@ export function convolve3x3Gray(
   //
   // Border handling: clamp-to-edge (replicate edge pixels) so output stays same size.
   const out = new Uint8ClampedArray(width * height);
+  convolve3x3GrayInto(gray, width, height, k, opts, out);
+  return out;
+}
+
+export function convolve3x3GrayInto(
+  gray: Float32Array,
+  width: number,
+  height: number,
+  k: Kernel3x3,
+  opts: { bias?: number; scale?: number } | undefined,
+  out: Uint8ClampedArray,
+): void {
+  if (out.length !== width * height) {
+    throw new Error("out length must equal width*height");
+  }
+
   const bias = opts?.bias ?? 0;
   const scale = opts?.scale ?? 1;
 
@@ -61,7 +77,5 @@ export function convolve3x3Gray(
       out[y * width + x] = v < 0 ? 0 : v > 255 ? 255 : v;
     }
   }
-
-  return out;
 }
 
