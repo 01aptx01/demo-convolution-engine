@@ -1,0 +1,17 @@
+services:
+  server:
+    build:
+      context: ./server
+    ports:
+      - "5000:5000"
+
+  web:
+    build:
+      context: ./web
+    environment:
+      - NEXT_PUBLIC_API_BASE=http://localhost:5000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - server
+
